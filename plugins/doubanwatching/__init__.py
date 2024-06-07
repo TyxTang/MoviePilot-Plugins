@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Optional
 
 from app.chain.media import MediaChain
 from app.core.event import eventmanager, Event
@@ -8,7 +8,6 @@ from app.plugins import _PluginBase
 from app.plugins.doubanwatching.DoubanHelper import *
 from app.schemas import WebhookEventInfo, MediaInfo
 from app.schemas.types import EventType, MediaType
-from app.log import logger
 
 
 class DouBanWatching(_PluginBase):
@@ -19,7 +18,7 @@ class DouBanWatching(_PluginBase):
     # 插件图标
     plugin_icon = "douban.png"
     # 插件版本
-    plugin_version = "1.8.1"
+    plugin_version = "1.8.6"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -59,7 +58,8 @@ class DouBanWatching(_PluginBase):
             logger.info(f"关键词排除媒体文件{path}")
             return
 
-        processed_items: Dict = self.get_data("marked") or self.get_data("processed") or {}
+        processed_items: Dict = self.get_data('data') or {}
+
         if event_info.event in play_start and \
                 event_info.user_name in self._user.split(','):
             """
@@ -107,10 +107,23 @@ class DouBanWatching(_PluginBase):
                 if processed_items.get(title) and len(episodes) != episode_id:
                     logger.info(f"{title} 已同步到豆瓣在看，不处理")
                     return
+
             # 处理电影
             else:
                 title = event_info.item_name
                 status = "collect"
+                meta = MetaInfo(title)
+                meta.type = MediaType("电视剧" if event_info.item_type == "TV" else "电影")
+                # 识别媒体信息
+                mediainfo: MediaInfo = MediaChain().recognize_media(meta=meta, mtype=meta.type,
+                                                                    tmdbid=event_info.tmdb_id,
+                                                                    cache=True)
+                if not mediainfo:
+                    logger.warn(
+                        f'标题：{title}，tmdbid：{event_info.tmdb_id}，指定tmdbid未识别到媒体信息，尝试仅使用标题识别')
+                    meta.tmdbid = None
+                    mediainfo = MediaChain().recognize_media(meta=meta, mtype=meta.type,
+                                                             cache=False)
 
                 if processed_items.get(title):
                     logger.info(f"{title} 已同步到豆瓣在看，不处理")
@@ -128,8 +141,10 @@ class DouBanWatching(_PluginBase):
                         "subject_id": subject_id,
                         "subject_name": subject_name,
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "poster_path": mediainfo.poster_path,
+                        "type": "电视剧" if event_info.item_type == "TV" else "电影"
                     }
-                    self.save_data("marked", processed_items)
+                    self.save_data('data', processed_items)
                     logger.info(f"{title} 同步到档案成功")
                 else:
                     logger.info(f"{title} 同步到档案失败")
@@ -328,3 +343,127 @@ class DouBanWatching(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         pass
+
+    def get_dashboard(self, **kwargs) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], List[dict]]]:
+        """
+        获取插件仪表盘页面，需要返回：1、仪表板col配置字典；2、全局配置（自动刷新等）；3、仪表板页面元素配置json（含数据）
+        1、col配置参考：
+        {
+            "cols": 12, "md": 6
+        }
+        2、全局配置参考：
+        {
+            "refresh": 10, // 自动刷新时间，单位秒
+            "border": True, // 是否显示边框，默认True，为False时取消组件边框和边距，由插件自行控制
+            "title": "组件标题", // 组件标题，如有将显示该标题，否则显示插件名称
+            "subtitle": "组件子标题", // 组件子标题，缺省时不展示子标题
+        }
+        3、页面配置使用Vuetify组件拼装，参考：https://vuetifyjs.com/
+
+        kwargs参数可获取的值：1、user_agent：浏览器UA
+
+        :param key: 仪表盘key，根据指定的key返回相应的仪表盘数据，缺省时返回一个固定的仪表盘数据（兼容旧版）
+        """
+        cols = {
+            "cols": 12, "md": 6
+        }
+        attrs = {"refresh": 600, "border": True}
+        num = 2 if self.is_mobile(kwargs.get('user_agent')) else 3
+        elements = [
+            {
+                'component': 'VRow',
+                'props': {
+                },
+                'content': [
+                    {
+                        'component': 'VTimeline',
+                        'props': {
+                            'dot-color': '#AF85FD',
+                            'direction': "horizontal",
+                            'style': 'padding: 1rem 1rem 1rem 1rem',
+                        },
+                        "content": self.get_line_item(num)
+                    }
+                ]
+            }
+        ]
+
+        return cols, attrs, elements
+
+    def get_line_item(self, num: int = 2) -> dict:
+        """
+        processed_items[f"{title}"] = {
+                        "subject_id": subject_id,
+                        "subject_name": subject_name,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+        """
+        data: Dict = self.get_data('data') or {}
+        content = []
+        logger.info(' ')
+        for key, val in list(data.items())[-num:][::-1]:
+            if not isinstance(val, dict):
+                continue
+            if not val.get('poster_path', ''):
+                meta = MetaInfo(val.get("subject_name"))
+                meta.type = MediaType("电视剧" if not val.get("type", '') else val.get("type"))
+                # 识别媒体信息
+                mediainfo: MediaInfo = MediaChain().recognize_media(meta=meta, mtype=meta.type,
+                                                                    cache=True)
+                poster_path = mediainfo.poster_path
+            else:
+                poster_path = val.get('poster_path')
+
+            content.append({
+                "component": "VTimelineItem",
+                "props": {
+                    "size": "small",
+                },
+                "content": [
+                    {
+                        "component": "a",
+                        'props': {
+                            'href': 'https://www.douban.com/doubanapp/dispatch?uri=/movie/' + val.get(
+                                'subject_id') + '?from=mdouban&open=app',
+                            'target': '_blank'
+                        },
+                        "content": [
+                            {
+                                "component": "VCard",
+                                "props": {
+                                    "class": "elevation-4"
+                                },
+                                "content": [
+                                    {
+                                        'component': 'VCol',
+                                        'props': {
+                                            'style': 'padding: 0rem 0rem 0rem 0rem'
+                                        },
+                                        'content': [
+                                            {
+                                                "component": "VImg",
+                                                "props": {
+                                                    "src": poster_path.replace("/original/", "/w200/"),
+                                                    "style": "width:100px; height: 150px;",
+                                                    "aspect-ratio": "2/3"
+                                                }
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            })
+        return content
+
+    @staticmethod
+    def is_mobile(user_agent):
+        mobile_keywords = [
+            'Mobile', 'Android', 'Silk/', 'Kindle', 'BlackBerry', 'Opera Mini', 'Opera Mobi', 'iPhone', 'iPad'
+        ]
+        for keyword in mobile_keywords:
+            if re.search(keyword, user_agent, re.IGNORECASE):
+                return True
+        return False
